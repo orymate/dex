@@ -329,7 +329,7 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 		return handler.ServeHTTP
 	}
 
-	if c.PrometheusRegistry != nil {
+	if false {//c.PrometheusRegistry != nil {
 		requestCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "http_requests_total",
 			Help: "Count of all HTTP requests.",

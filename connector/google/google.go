@@ -15,16 +15,17 @@ import (
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	admin "google.golang.org/api/admin/directory/v1"
+	cloudidentity "google.golang.org/api/cloudidentity/v1"
 	"google.golang.org/api/option"
 
 	"github.com/dexidp/dex/connector"
-	pkg_groups "github.com/dexidp/dex/pkg/groups"
 	"github.com/dexidp/dex/pkg/log"
 )
 
 const (
 	issuerURL                  = "https://accounts.google.com"
 	wildcardDomainToAdminEmail = "*"
+	googleIAMScope             = "https://www.googleapis.com/auth/cloud-identity.groups.readonly"
 )
 
 // Config holds configuration options for Google logins.
@@ -82,7 +83,7 @@ func (c *Config) Open(id string, logger log.Logger) (conn connector.Connector, e
 		return nil, fmt.Errorf("failed to get provider: %v", err)
 	}
 
-	scopes := []string{oidc.ScopeOpenID}
+	scopes := []string{oidc.ScopeOpenID, googleIAMScope}
 	if len(c.Scopes) > 0 {
 		scopes = append(scopes, c.Scopes...)
 	} else {
@@ -205,11 +206,9 @@ func (c *googleConnector) HandleCallback(s connector.Scopes, r *http.Request) (i
 		return identity, &oauth2Error{errType, q.Get("error_description")}
 	}
 	token, err := c.oauth2Config.Exchange(r.Context(), q.Get("code"))
-	if err != nil {
-		return identity, fmt.Errorf("google: failed to get token: %v", err)
-	}
+	tokenSource := c.oauth2Config.TokenSource(context.TODO(), token)
 
-	return c.createIdentity(r.Context(), identity, s, token)
+	return c.createIdentity(r.Context(), identity, s, tokenSource)
 }
 
 func (c *googleConnector) Refresh(ctx context.Context, s connector.Scopes, identity connector.Identity) (connector.Identity, error) {
@@ -217,15 +216,16 @@ func (c *googleConnector) Refresh(ctx context.Context, s connector.Scopes, ident
 		RefreshToken: string(identity.ConnectorData),
 		Expiry:       time.Now().Add(-time.Hour),
 	}
-	token, err := c.oauth2Config.TokenSource(ctx, t).Token()
-	if err != nil {
-		return identity, fmt.Errorf("google: failed to get token: %v", err)
-	}
+	token := c.oauth2Config.TokenSource(ctx, t)
 
 	return c.createIdentity(ctx, identity, s, token)
 }
 
-func (c *googleConnector) createIdentity(ctx context.Context, identity connector.Identity, s connector.Scopes, token *oauth2.Token) (connector.Identity, error) {
+func (c *googleConnector) createIdentity(ctx context.Context, identity connector.Identity, s connector.Scopes, tokenSource oauth2.TokenSource) (connector.Identity, error) {
+	token, err := tokenSource.Token()
+	if err != nil {
+		return identity, fmt.Errorf("google: failed to get token: %v", err)
+	}
 	rawIDToken, ok := token.Extra("id_token").(string)
 	if !ok {
 		return identity, errors.New("google: no id_token in token response")
@@ -260,18 +260,15 @@ func (c *googleConnector) createIdentity(ctx context.Context, identity connector
 	}
 
 	var groups []string
-	if s.Groups && len(c.adminSrv) > 0 {
-		checkedGroups := make(map[string]struct{})
-		groups, err = c.getGroups(claims.Email, c.fetchTransitiveGroupMembership, checkedGroups)
+	if len(c.groups) > 0 {
+		groups, err = c.getGroups2(ctx, claims.Email, tokenSource, c.groups)
 		if err != nil {
 			return identity, fmt.Errorf("google: could not retrieve groups: %v", err)
 		}
 
-		if len(c.groups) > 0 {
-			groups = pkg_groups.Filter(groups, c.groups)
-			if len(groups) == 0 {
-				return identity, fmt.Errorf("google: user %q is not in any of the required groups", claims.Username)
-			}
+		if len(groups) == 0 {
+			// TODO check
+			return identity, fmt.Errorf("google: user %q is not in any of the required groups", claims.Username)
 		}
 	}
 
@@ -284,6 +281,39 @@ func (c *googleConnector) createIdentity(ctx context.Context, identity connector
 		Groups:        groups,
 	}
 	return identity, nil
+}
+
+func (c *googleConnector) getGroups2(ctx context.Context, email string, token oauth2.TokenSource, groups []string) ([]string, error) {
+	var userGroups []string
+	var err error
+	svc, err := cloudidentity.NewService(ctx, option.WithTokenSource(token))
+	if err != nil {
+		return nil, err
+	}
+
+	query := fmt.Sprintf("member_key_id=='%s'", email)
+	c.logger.Debugf("group search query=%q", query)
+	err = svc.Groups.Memberships.SearchDirectGroups("groups/-").Query(query).Pages(ctx, func (result *cloudidentity.SearchDirectGroupsResponse) error {
+		for _, group := range result.Memberships {
+			userGroups = append(userGroups, group.GroupKey.Id)
+		}
+		return nil
+	})
+	// TODO transitive
+
+	/*
+	for _, group := range groups {
+		result, err := svc.Groups.Memberships.CheckTransitiveMembership(group).Do()
+		if err != nil {
+			return nil, err
+		}
+		if result.HasMembership {
+			userGroups = append(userGroups, group)
+		}
+	}
+	*/
+
+	return userGroups, err
 }
 
 // getGroups creates a connection to the admin directory service and lists
